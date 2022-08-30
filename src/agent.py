@@ -17,6 +17,8 @@ from baselines.common import plot_util as pu
 from src.env_wrappers import VecNormalize, TimeLimitMask
 from src.model import Model_Actor_Critic
 
+
+
 class PPO_Agent():
     def __init__(self, params, env_name, model_dir, log_dir, plot_dir, seed=0):
         self.params = params
@@ -28,7 +30,26 @@ class PPO_Agent():
         self.model_dir = model_dir
         self.plot_dir = plot_dir
         self.log_dir = log_dir
-    
+
+        # Construct agent
+        self.construct_agent()
+
+        # Create log directory
+        os.makedirs(os.path.join(self.log_dir, self.env_name.split('-')[0]), exist_ok=True)
+
+        # Construct testing environment - bench.Monitor used for logging episodes, VecNormalize for normalizing states & rewards
+        self.env = bench.Monitor(self.env, os.path.join(self.log_dir, self.env_name.split('-')[0], '0'), allow_early_resets=True) # FILE PATH MUST HAVE A DIGIT AT END
+        self.env = DummyVecEnv([lambda: self.env]) # Needed to use the VecNormalize wrapper
+        self.env = VecNormalize(self.env,
+                                ob=True, ret=True,
+                                gamma=self.params['GAMMA']) # Normalize states AND rewards for training
+
+        global NUM_TRAIN_UPDATES
+        global MINIBATCH_SIZE
+        NUM_TRAIN_UPDATES = int(self.params['NUM_ENV_TIMESTEPS']) // self.params['NUM_TIMESTEPS_PER_UPDATE']
+        MINIBATCH_SIZE = int(self.params['NUM_TIMESTEPS_PER_UPDATE']) // self.params['NUM_MINIBATCHES']
+        self.save_prefix = model_dir
+
     def construct_agent(self):
         self.env = gym.make(self.env_name) # Note: Do not unwrap, only need general attributes of env
 
@@ -91,25 +112,9 @@ class PPO_Agent():
         return train_model
 
     def train(self):
-        # Construct agent
-        self.construct_agent()
-
-        # Create log directory
-        os.makedirs(os.path.join(self.log_dir, self.env_name.split('-')[0]), exist_ok=True)
-
-        # Construct testing environment - bench.Monitor used for logging episodes, VecNormalize for normalizing states & rewards
-        self.env = bench.Monitor(self.env, os.path.join(self.log_dir, self.env_name.split('-')[0], '0')) # FILE PATH MUST HAVE A DIGIT AT END
-        self.env = DummyVecEnv([lambda: self.env]) # Needed to use the VecNormalize wrapper
-        self.env = VecNormalize(self.env, 
-                                ob=True, ret=True, 
-                                gamma=self.params['GAMMA']) # Normalize states AND rewards for training
-
         episode_reward_summary = deque(maxlen=10)
 
         state = self.env.reset() # Reset once at beginning, all subsequent resets handled by monitor
-
-        NUM_TRAIN_UPDATES = int(self.params['NUM_ENV_TIMESTEPS']) // self.params['NUM_TIMESTEPS_PER_UPDATE']
-        MINIBATCH_SIZE = int(self.params['NUM_TIMESTEPS_PER_UPDATE']) // self.params['NUM_MINIBATCHES']
 
         for update in range(1, NUM_TRAIN_UPDATES + 1):
             start_time = time.time()
@@ -126,10 +131,9 @@ class PPO_Agent():
             
             """Perform Rollout"""
             for update_step in range(1, self.params['NUM_TIMESTEPS_PER_UPDATE'] + 1):
+                #self.env.render()
                 value, action, action_logp = self.actor_critic.act(state)
-                
                 next_state, reward, done, info = self.env.step(action)
-
                 if 'episode' in info.keys():
                     episode_reward_summary.append(info['episode']['r']) # Logged by bench.Monitor
                 
@@ -141,6 +145,7 @@ class PPO_Agent():
                 masks.append((0.0 if done else 1.0))
                 bad_masks.append((0.0 if 'bad_transition' in info.keys() else 1.0)) # Occurs when a done is the result
                                                                                     # of exceeding the environment step limit
+
                 state = next_state
             
             values.append(self.actor_critic.get_value(next_state))
@@ -178,21 +183,30 @@ class PPO_Agent():
                     .format(update, NUM_TRAIN_UPDATES, self.params['NUM_TIMESTEPS_PER_UPDATE'] * update, len(episode_reward_summary),
                     np.mean(episode_reward_summary), np.median(episode_reward_summary), np.min(episode_reward_summary),
                     np.max(episode_reward_summary), elapsed_time))
-
+            l = open(self.save_prefix + "/Mean_rewards.txt", "a+")
+            l.write("Timestep %d    " % int(self.params['NUM_TIMESTEPS_PER_UPDATE'] * update))
+            l.write("Minimum %d     " % np.min(episode_reward_summary))
+            l.write("Maximum %d     " % np.max(episode_reward_summary))
+            l.write("Average %d\r\n" % np.mean(episode_reward_summary))
+            l.close()
+            k = open(self.save_prefix + "/Episode_reward.txt", "a+")
+            k.write("Episode %d    " % len(episode_reward_summary))
+            k.write("Score %d\r\n" % episode_reward_summary[-1])
+            k.close()
             if (update % self.params['SAVE_INTERVAL'] == 0 or update == NUM_TRAIN_UPDATES):
                 # Save model weights
-                model_path = os.path.join(self.model_dir, self.env_name, 'model_weights')
+                model_path = os.path.join(self.model_dir, self.env_name, 'model_weights{}'.format(update))
                 self.actor_critic.save_weights(model_path)
 
                 # Save ob_rms from enviornment via pickle so that it can be restored when testing 
-                vecnorm_path = os.path.join(self.model_dir, self.env_name, 'vecnorm_stats.pickle')
+                vecnorm_path = os.path.join(self.model_dir, self.env_name, 'vecnorm_stats.pickle{}'.format(update))
                 with open(vecnorm_path, 'wb') as handle:
                     pickle.dump(getattr(self.env, 'ob_rms', None), handle, protocol=pickle.HIGHEST_PROTOCOL)
 
         # Done with environment, can close
         self.env.close()
     
-    def test(self):
+    def test(self, load = None):
         # Construct agent
         self.construct_agent()
 
@@ -201,12 +215,12 @@ class PPO_Agent():
         self.env = VecNormalize(self.env, ob=True, ret=False)
 
         # Restore model weights
-        model_path = os.path.join(self.model_dir, self.env_name, 'model_weights')
+        model_path = os.path.join(self.model_dir, self.env_name, 'model_weights{}'.format(load))
         self.actor_critic.load_weights(model_path)
 
         # Restored saved ob_rms to environment, disable updates to ob_rms
         saved_ob_rms = None
-        vecnorm_path = os.path.join(self.model_dir, self.env_name, 'vecnorm_stats.pickle')
+        vecnorm_path = os.path.join(self.model_dir, self.env_name, 'vecnorm_stats.pickle{}'.format(load))
         with open(vecnorm_path, 'rb') as handle:
             saved_ob_rms = pickle.load(handle)
 
@@ -215,14 +229,23 @@ class PPO_Agent():
         self.env.eval()
 
         state = self.env.reset() # Reset once at beginning, all subsequent resets handled by monitor
-
         """ Only performing rollout for testing """
+        score = 0
+        ep_len = 0
         while True: # Indefinitely performs rollout in simulator until closed
             self.env.render() 
 
             _, action, _ = self.actor_critic.act(state)
-            next_state, _, _, _ = self.env.step(action)
-            
+            next_state, rew, done, info = self.env.step(action)
+            score += rew
+            ep_len += 1
+            if done:
+                l = open(self.model_dir + "/Test_results.txt", "a+")
+                l.write("Score %d\r\n    " % score)
+                l.close()
+                score = 0
+                ep_len = 0
+
             state = next_state
 
         # Done with environment, can close
@@ -242,3 +265,22 @@ class PPO_Agent():
         fig.savefig(plot_path, bbox_inches='tight')
 
         plt.show()
+
+    def initial_traj_collect(self, roll_len):
+        data = np.array([np.array([0] * self.env.observation_space.shape[0]), np.array([0] * self.env.action_space.shape[0]),
+                         np.array([0] * self.env.observation_space.shape[0]), True, 0.0],
+                        dtype=object)
+
+        state = self.env.reset()  # Reset once at beginning, all subsequent resets handled by monitor
+
+        """ Only performing rollout for testing """
+        for i in range(roll_len):  # Indefinitely performs rollout in simulator until closed
+            #self.env.render()
+            _, action, _ = self.actor_critic.act(state)
+            next_state, reward, done, _ = self.env.step(action)
+            exp = np.array([np.reshape(state, [self.env.observation_space.shape[0]]), action, next_state, done, reward],
+                           dtype=object)
+            data = np.vstack((data, exp))
+            state = next_state
+        np.save("Cheetah_withx.npy", data, allow_pickle=True)
+        return

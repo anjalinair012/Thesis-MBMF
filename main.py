@@ -116,6 +116,11 @@ if __name__ == '__main__':
                           default=1e-7, 
                           help='Value of epsilon for the optimizer - episilon used to avoid divide by zero errors when gradient is near zero (default: 1e-7)',
                           metavar='')
+    optional.add_argument('--load_at',
+                          type=int,
+                          default=0,
+                          help='LOading value for testing',
+                          metavar='')
 
     args = parser.parse_args()
 
@@ -142,9 +147,10 @@ if __name__ == '__main__':
     }
 
     agent = PPO_Agent(params, args.env, args.model_dir, args.log_dir, args.plot_dir, seed=args.seed)
+    # agent.initial_traj_collect(25000)
     if (args.mode == "train"):
         agent.train()
     elif (args.mode == "test"):
-        agent.test()
+        agent.test(args.load_at)
     else:
         agent.plot_results()
